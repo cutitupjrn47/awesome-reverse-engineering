@@ -16,6 +16,8 @@ py -3.10 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install torch==2.5.1 torchaudio==2.5.1 torchvision==0.20.1
 .\.venv\Scripts\python.exe -m pip install -r app\requirements.txt
+# Install the test-only dependency separately from the heavyweight runtime stack.
+.\.venv\Scripts\python.exe -m pip install -r app\requirements-test.txt
 ```
 
 Place each voice in a folder under `app\models`, for example:
@@ -49,6 +51,6 @@ Demucs separates vocals from accompaniment before conversion by default. Denoisi
 
 Job files are stored under `VOICE_WORK_DIR`. Each API conversion runs in a spawned worker process so cancellation can stop synchronous RVC inference as well as decoding and source separation; failed and cancelled job files are removed only after the worker stops. Successful jobs keep only the downloadable WAV result. On startup, leftover directories named for prior job UUIDs are removed, so completed results are available only until the next restart.
 
-Run the app tests from the repository root with `python -m unittest tests.test_voice_app -v`.
+Run the app tests from the repository root with `.\.venv\Scripts\python.exe -m unittest tests.test_voice_app -v`.
 ```
 ```
