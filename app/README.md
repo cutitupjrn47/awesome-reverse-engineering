@@ -47,7 +47,7 @@ The first separation can download Demucs weights, and the first conversion can d
 
 Demucs separates vocals from accompaniment before conversion by default. Denoising and WPE dereverberation are opt-in; both add processing time and may change vocal quality. RVC inference performs its own chunked feature/pitch/inference processing. The service hashes each uploaded source with SHA-256, caps audio files at `VOICE_MAX_UPLOAD_BYTES` (200,000,000 bytes by default), limits decoded duration and concurrent work, and keeps jobs in memory until the service restarts. `POST /swap` also enforces a streamed request-body cap of the configured audio limit plus 1 MiB for multipart boundaries, headers, and form fields; this applies even when the request omits `Content-Length`. The route's file-size check remains as defense in depth.
 
-Job files are stored under `VOICE_WORK_DIR`. Failed and cancelled jobs are removed when processing stops; successful jobs keep only the downloadable WAV result. On startup, leftover directories named for prior job UUIDs are removed, so completed results are available only until the next restart.
+Job files are stored under `VOICE_WORK_DIR`. Each API conversion runs in a spawned worker process so cancellation can stop synchronous RVC inference as well as decoding and source separation; failed and cancelled job files are removed only after the worker stops. Successful jobs keep only the downloadable WAV result. On startup, leftover directories named for prior job UUIDs are removed, so completed results are available only until the next restart.
 
 Run the app tests from the repository root with `python -m unittest tests.test_voice_app -v`.
 ```

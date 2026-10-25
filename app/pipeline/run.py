@@ -36,7 +36,10 @@ def run_pipeline(
     context.update(5, "decoding")
     decoded_path = context.work_dir / "decoded.wav"
     source, sample_rate = decode_audio(
-        input_path, decoded_path, settings.max_duration_seconds
+        input_path,
+        decoded_path,
+        settings.max_duration_seconds,
+        cancel_event=context.cancel_event,
     )
     context.check_cancelled()
 

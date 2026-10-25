@@ -30,9 +30,12 @@ def separate_vocals(
         str(output_dir),
         str(input_path),
     ]
-    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as error_log:
+    with tempfile.TemporaryFile(mode="w+b") as error_log:
         process = subprocess.Popen(
-            command, stdout=subprocess.DEVNULL, stderr=error_log, text=True
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=error_log,
         )
         while process.poll() is None:
             if cancel_event.wait(0.25):
@@ -46,7 +49,10 @@ def separate_vocals(
         if process.returncode:
             error_log.seek(0, 2)
             error_log.seek(max(0, error_log.tell() - 1000))
-            detail = error_log.read().strip() or f"Demucs exited with {process.returncode}"
+            detail = (
+                error_log.read().decode("utf-8", errors="replace").strip()
+                or f"Demucs exited with {process.returncode}"
+            )
             raise RuntimeError(f"Source separation failed: {detail}")
 
     stem_dir = output_dir / "htdemucs" / input_path.stem

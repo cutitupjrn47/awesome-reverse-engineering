@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import shutil
 import subprocess
+import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
 import soundfile as sf
+
+from app.jobs import JobCancelledError
 
 
 class AudioInputError(ValueError):
@@ -22,38 +26,73 @@ def hash_file(path: Path) -> str:
 
 
 def decode_audio(
-    source_path: Path, decoded_path: Path, max_duration_seconds: int
+    source_path: Path,
+    decoded_path: Path,
+    max_duration_seconds: int,
+    cancel_event=None,
 ) -> tuple[np.ndarray, int]:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise RuntimeError("FFmpeg is required to decode uploaded audio")
+    command = [
+        ffmpeg,
+        "-nostdin",
+        "-v",
+        "error",
+        "-y",
+        "-i",
+        str(source_path),
+        "-t",
+        str(max_duration_seconds + 1),
+        "-map",
+        "0:a:0",
+        "-ac",
+        "2",
+        "-ar",
+        "44100",
+        "-c:a",
+        "pcm_s16le",
+        str(decoded_path),
+    ]
     try:
-        subprocess.run(
-            [
-                ffmpeg,
-                "-nostdin",
-                "-v",
-                "error",
-                "-y",
-                "-i",
-                str(source_path),
-                "-t",
-                str(max_duration_seconds + 1),
-                "-map",
-                "0:a:0",
-                "-ac",
-                "2",
-                "-ar",
-                "44100",
-                "-c:a",
-                "pcm_s16le",
-                str(decoded_path),
-            ],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
+        if cancel_event is None:
+            subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        else:
+            with tempfile.TemporaryFile(mode="w+b") as error_log:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=error_log,
+                )
+                deadline = time.monotonic() + 300
+                while process.poll() is None:
+                    if cancel_event.wait(0.1):
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait()
+                        raise JobCancelledError("Job was cancelled during decoding")
+                    if time.monotonic() >= deadline:
+                        process.kill()
+                        process.wait()
+                        raise AudioInputError("Audio decoding timed out")
+                if process.returncode:
+                    error_log.seek(0, 2)
+                    error_log.seek(max(0, error_log.tell() - 500))
+                    detail = (
+                        error_log.read().decode("utf-8", errors="replace").strip()
+                        or "invalid audio"
+                    )
+                    raise AudioInputError(f"Could not decode uploaded audio: {detail}")
     except subprocess.TimeoutExpired as error:
         raise AudioInputError("Audio decoding timed out") from error
     except subprocess.CalledProcessError as error:

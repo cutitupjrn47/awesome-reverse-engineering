@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import multiprocessing
 import shutil
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -44,6 +46,7 @@ class Job:
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    isolated: bool = False
     future: Future[None] | None = field(default=None, repr=False)
 
     def public(self) -> dict[str, object]:
@@ -79,7 +82,43 @@ class JobContext:
             raise JobCancelledError("Job was cancelled")
 
 
+class _IsolatedJobContext:
+    def __init__(self, work_dir: Path, cancel_event, connection):
+        self.work_dir = work_dir
+        self.cancel_event = cancel_event
+        self._connection = connection
+
+    def update(self, progress: int, stage: str) -> None:
+        self._connection.send(("progress", progress, stage))
+
+    def check_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise JobCancelledError("Job was cancelled")
+
+
+def _run_isolated_task(task, work_dir: Path, cancel_event, connection) -> None:
+    try:
+        result_path = task(_IsolatedJobContext(work_dir, cancel_event, connection))
+        connection.send(("result", str(result_path)))
+    except BaseException as error:
+        try:
+            connection.send(("error", type(error).__name__, str(error)))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        connection.close()
+
+
+def _connection_poll(connection, timeout: float = 0) -> bool:
+    try:
+        return connection.poll(timeout)
+    except (EOFError, OSError):
+        return False
+
+
 class JobManager:
+    _CANCEL_GRACE_SECONDS = 0.5
+
     def __init__(self, max_workers: int = 1, max_active_jobs: int = 8):
         if max_workers < 1 or max_active_jobs < max_workers:
             raise ValueError("max_active_jobs must be >= max_workers >= 1")
@@ -88,6 +127,8 @@ class JobManager:
         )
         self._max_active_jobs = max_active_jobs
         self._jobs: dict[str, Job] = {}
+        self._process_context = multiprocessing.get_context("spawn")
+        self._processes: dict[str, multiprocessing.Process] = {}
         self._lock = threading.RLock()
         self._shutdown_lock = threading.Lock()
         self._shutdown = False
@@ -98,6 +139,8 @@ class JobManager:
         work_dir: Path,
         input_sha256: str,
         task: Callable[[JobContext], Path],
+        *,
+        isolated: bool = False,
     ) -> Job:
         UUID(job_id)
         with self._lock:
@@ -110,7 +153,7 @@ class JobManager:
                 raise QueueFullError("The voice-conversion queue is full")
             if job_id in self._jobs:
                 raise JobConflictError("Job id already exists")
-            job = Job(job_id, work_dir, input_sha256)
+            job = Job(job_id, work_dir, input_sha256, isolated=isolated)
             self._jobs[job_id] = job
             job.future = self._executor.submit(self._run, job, task)
             return job
@@ -154,7 +197,10 @@ class JobManager:
             return
 
         try:
-            result_path = task(JobContext(job, self))
+            if job.isolated:
+                result_path = self._run_isolated(job, task)
+            else:
+                result_path = task(JobContext(job, self))
             if not result_path.is_file():
                 raise RuntimeError("Conversion finished without creating an output file")
         except JobCancelledError:
@@ -186,6 +232,94 @@ class JobManager:
                 succeeded = job.status == "succeeded"
                 result_path = job.result_path if succeeded else None
             self._cleanup_work_dir(job.work_dir, result_path)
+
+    def _run_isolated(self, job: Job, task: Callable[[JobContext], Path]) -> Path:
+        cancel_event = self._process_context.Event()
+        receive, send = self._process_context.Pipe(duplex=False)
+        process = self._process_context.Process(
+            target=_run_isolated_task,
+            args=(task, job.work_dir, cancel_event, send),
+            name=f"voice-job-{job.id}",
+        )
+        started = False
+        result_path: Path | None = None
+        child_error: tuple[str, str] | None = None
+        cancel_started: float | None = None
+        try:
+            process.start()
+            started = True
+            send.close()
+            with self._lock:
+                self._processes[job.id] = process
+
+            while process.is_alive() or _connection_poll(receive):
+                if job.cancel_event.is_set():
+                    cancel_event.set()
+                    if cancel_started is None:
+                        cancel_started = time.monotonic()
+                    elif (
+                        time.monotonic() - cancel_started
+                        >= self._CANCEL_GRACE_SECONDS
+                    ):
+                        self._stop_process(process)
+
+                if _connection_poll(receive, 0.05):
+                    try:
+                        message = receive.recv()
+                    except EOFError:
+                        break
+                    if message[0] == "progress":
+                        self.update(job.id, message[1], message[2])
+                    elif message[0] == "result":
+                        result_path = Path(message[1])
+                    elif message[0] == "error":
+                        child_error = (message[1], message[2])
+
+            process.join()
+            while _connection_poll(receive):
+                try:
+                    message = receive.recv()
+                except EOFError:
+                    break
+                if message[0] == "progress":
+                    self.update(job.id, message[1], message[2])
+                elif message[0] == "result":
+                    result_path = Path(message[1])
+                elif message[0] == "error":
+                    child_error = (message[1], message[2])
+
+            if job.cancel_event.is_set():
+                raise JobCancelledError("Job was cancelled")
+            if child_error is not None:
+                raise RuntimeError(f"{child_error[0]}: {child_error[1]}")
+            if process.exitcode != 0:
+                raise RuntimeError(
+                    f"Conversion worker exited with code {process.exitcode}"
+                )
+            if result_path is None:
+                raise RuntimeError("Conversion worker exited without a result")
+            return result_path
+        finally:
+            if started and process.is_alive():
+                cancel_event.set()
+                self._stop_process(process)
+            if started:
+                process.join()
+                process.close()
+            send.close()
+            receive.close()
+            with self._lock:
+                self._processes.pop(job.id, None)
+
+    @staticmethod
+    def _stop_process(process: multiprocessing.Process) -> None:
+        if not process.is_alive():
+            return
+        process.terminate()
+        process.join(timeout=1)
+        if process.is_alive():
+            process.kill()
+            process.join()
 
     def update(self, job_id: str, progress: int, stage: str) -> None:
         if not 0 <= progress <= 100 or not stage:

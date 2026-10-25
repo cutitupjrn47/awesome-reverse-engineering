@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import shutil
 from contextlib import asynccontextmanager
+from functools import partial
 from pathlib import Path
 from uuid import uuid4
 
@@ -200,18 +201,19 @@ async def create_swap(
         ),
     )
 
-    def task(context):
-        return run_pipeline(
-            context,
-            input_path,
-            work_dir / "converted.wav",
-            voice,
-            options,
-            settings,
-        )
+    task = partial(
+        run_pipeline,
+        input_path=input_path,
+        output_path=work_dir / "converted.wav",
+        voice=voice,
+        options=options,
+        settings=settings,
+    )
 
     try:
-        job = request.app.state.jobs.submit(job_id, work_dir, input_hash, task)
+        job = request.app.state.jobs.submit(
+            job_id, work_dir, input_hash, task, isolated=True
+        )
     except QueueFullError as error:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(429, str(error)) from error

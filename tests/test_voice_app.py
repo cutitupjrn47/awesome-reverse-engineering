@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import threading
 import time
 import types
 import unittest
 from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -25,6 +27,21 @@ from app.pipeline.convert import ConversionOptions, RVCConverter
 from app.pipeline.ingest import AudioInputError, decode_audio
 from app.pipeline.mix import mix_audio
 from app.pipeline.run import SwapOptions, run_pipeline
+
+
+def _blocking_isolated_task(context, started_path: Path) -> Path:
+    started_path.write_text(str(os.getpid()), encoding="ascii")
+    time.sleep(60)
+    result_path = context.work_dir / "result.wav"
+    result_path.write_bytes(b"unexpected completion")
+    return result_path
+
+
+def _fake_pipeline(context, input_path, output_path, voice, options, settings):
+    if input_path.read_bytes() != b"audio" or voice.id != "demo":
+        raise AssertionError("The isolated pipeline received invalid job data")
+    output_path.write_bytes(b"wav-result")
+    return output_path
 
 
 class VoiceRegistryTests(unittest.TestCase):
@@ -119,6 +136,62 @@ class JobManagerTests(unittest.TestCase):
                 threading.Event().wait(0.01)
             self.assertEqual(manager.get(first_id).status, "cancelled")
             self.assertFalse(work_dir.exists())
+
+    def test_isolated_running_job_is_terminated_and_cleans_up_before_slot_reuse(self):
+        manager = JobManager(max_workers=1, max_active_jobs=1)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            work_dir = root / str(uuid4())
+            work_dir.mkdir()
+            (work_dir / "input.wav").write_bytes(b"input")
+            started_path = root / "worker.pid"
+            job_id = str(uuid4())
+            task = partial(_blocking_isolated_task, started_path=started_path)
+
+            try:
+                manager.submit(job_id, work_dir, "hash", task, isolated=True)
+                deadline = time.monotonic() + 10
+                while not started_path.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(started_path.exists(), "isolated worker did not start")
+
+                cancellation_started = time.monotonic()
+                manager.cancel(job_id)
+                while (
+                    manager.get(job_id).status not in {"cancelled", "failed"}
+                    and time.monotonic() - cancellation_started < 10
+                ):
+                    time.sleep(0.01)
+
+                self.assertEqual(manager.get(job_id).status, "cancelled")
+                self.assertLess(time.monotonic() - cancellation_started, 5)
+                self.assertFalse(work_dir.exists())
+                self.assertEqual(manager._processes, {})
+
+                replacement_dir = root / str(uuid4())
+                replacement_dir.mkdir()
+                replacement_id = str(uuid4())
+
+                def finish_replacement(context):
+                    result = replacement_dir / "result.wav"
+                    result.write_bytes(b"done")
+                    return result
+
+                manager.submit(
+                    replacement_id,
+                    replacement_dir,
+                    "hash",
+                    finish_replacement,
+                )
+                deadline = time.monotonic() + 5
+                while (
+                    manager.get(replacement_id).status not in {"succeeded", "failed"}
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.01)
+                self.assertEqual(manager.get(replacement_id).status, "succeeded")
+            finally:
+                manager.shutdown()
 
     def test_cancelling_queued_jobs_cleans_uploads_and_frees_capacity(self):
         manager = JobManager(max_workers=1, max_active_jobs=2)
@@ -386,7 +459,7 @@ class PipelineTests(unittest.TestCase):
                 patch(
                     "app.pipeline.run.decode_audio",
                     return_value=(input_audio, 44100),
-                ),
+                ) as decode,
                 patch(
                     "app.pipeline.run.convert_audio",
                     return_value=(np.full(441, 0.05, dtype=np.float32), 44100),
@@ -401,6 +474,12 @@ class PipelineTests(unittest.TestCase):
                     Settings(),
                 )
 
+            decode.assert_called_once_with(
+                root / "input.wav",
+                work_dir / "decoded.wav",
+                Settings().max_duration_seconds,
+                cancel_event=context.cancel_event,
+            )
             converted, sample_rate = sf.read(output, always_2d=True)
             self.assertEqual(sample_rate, 44100)
             self.assertEqual(converted.shape, input_audio.shape)
@@ -526,16 +605,10 @@ class ApiTests(unittest.TestCase):
                 max_workers=1,
             )
 
-            def fake_pipeline(context, input_path, output_path, voice, options, config):
-                self.assertEqual(input_path.read_bytes(), b"audio")
-                self.assertEqual(voice.id, "demo")
-                output_path.write_bytes(b"wav-result")
-                return output_path
-
             with (
                 patch.object(api_module, "settings", settings),
                 patch.object(api_module, "voices", VoiceRegistry(model_dir)),
-                patch.object(api_module, "run_pipeline", fake_pipeline),
+                patch.object(api_module, "run_pipeline", _fake_pipeline),
             ):
                 with TestClient(api_module.app) as client:
                     manager = client.app.state.jobs
@@ -547,7 +620,8 @@ class ApiTests(unittest.TestCase):
                     )
                     self.assertEqual(response.status_code, 202, response.text)
                     job_id = response.json()["id"]
-                    for _ in range(100):
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
                         job = client.get(f"/jobs/{job_id}").json()
                         if job["status"] in {"succeeded", "failed"}:
                             break
