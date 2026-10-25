@@ -84,6 +84,11 @@ class JobManagerTests(unittest.TestCase):
             self.assertEqual(completed.status, "succeeded")
             self.assertEqual(completed.progress, 100)
             self.assertTrue(completed.result_path.is_file())
+            for _ in range(100):
+                if list(work_dir.iterdir()) == [completed.result_path]:
+                    break
+                threading.Event().wait(0.01)
+            self.assertEqual(list(work_dir.iterdir()), [completed.result_path])
 
     def test_rejects_when_active_job_limit_is_reached(self):
         manager = JobManager(max_workers=1, max_active_jobs=1)
@@ -112,6 +117,127 @@ class JobManagerTests(unittest.TestCase):
                     break
                 threading.Event().wait(0.01)
             self.assertEqual(manager.get(first_id).status, "cancelled")
+            self.assertFalse(work_dir.exists())
+
+    def test_cancelling_queued_jobs_cleans_uploads_and_frees_capacity(self):
+        manager = JobManager(max_workers=1, max_active_jobs=2)
+        started = threading.Event()
+        release = threading.Event()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            running_dir = root / str(uuid4())
+            running_dir.mkdir()
+            running_upload = running_dir / "input.wav"
+            running_upload.write_bytes(b"running")
+
+            def running_task(context):
+                started.set()
+                release.wait(2)
+                context.check_cancelled()
+                result = running_dir / "result.wav"
+                result.touch()
+                return result
+
+            running_id = str(uuid4())
+            manager.submit(running_id, running_dir, "hash", running_task)
+            self.assertTrue(started.wait(1))
+
+            queued_dir = root / str(uuid4())
+            queued_dir.mkdir()
+            (queued_dir / "input.wav").write_bytes(b"queued")
+            queued_id = str(uuid4())
+            manager.submit(queued_id, queued_dir, "hash", running_task)
+            manager.cancel(queued_id)
+            self.assertFalse(queued_dir.exists())
+
+            replacement_dir = root / str(uuid4())
+            replacement_dir.mkdir()
+            replacement_id = str(uuid4())
+            manager.submit(replacement_id, replacement_dir, "hash", running_task)
+            manager.cancel(replacement_id)
+            self.assertFalse(replacement_dir.exists())
+
+            manager.cancel(running_id)
+            self.assertTrue(running_upload.exists())
+            release.set()
+            for _ in range(100):
+                if manager.get(running_id).status == "cancelled" and not running_dir.exists():
+                    break
+                threading.Event().wait(0.01)
+            self.assertEqual(manager.get(running_id).status, "cancelled")
+            self.assertFalse(running_dir.exists())
+
+    def test_running_cancellation_wins_before_success_is_published(self):
+        manager = JobManager(max_workers=1, max_active_jobs=1)
+        validating_result = threading.Event()
+        continue_validation = threading.Event()
+        with tempfile.TemporaryDirectory() as temporary:
+            work_dir = Path(temporary) / str(uuid4())
+            work_dir.mkdir()
+            result_path = work_dir / "result.wav"
+
+            class PausedResultPath:
+                def is_file(self):
+                    validating_result.set()
+                    continue_validation.wait(2)
+                    return result_path.is_file()
+
+                def resolve(self):
+                    return result_path.resolve()
+
+            def complete(context):
+                result_path.write_bytes(b"wav")
+                return PausedResultPath()
+
+            job_id = str(uuid4())
+            manager.submit(job_id, work_dir, "hash", complete)
+            self.assertTrue(validating_result.wait(1))
+            manager.cancel(job_id)
+            self.assertTrue(result_path.is_file())
+            continue_validation.set()
+
+            for _ in range(100):
+                if manager.get(job_id).status == "cancelled" and not work_dir.exists():
+                    break
+                threading.Event().wait(0.01)
+            self.assertEqual(manager.get(job_id).status, "cancelled")
+            self.assertFalse(work_dir.exists())
+
+    def test_failed_jobs_remove_their_work_directory(self):
+        manager = JobManager(max_workers=1, max_active_jobs=1)
+        with tempfile.TemporaryDirectory() as temporary:
+            work_dir = Path(temporary) / str(uuid4())
+            work_dir.mkdir()
+
+            def fail(context):
+                (work_dir / "intermediate.wav").write_bytes(b"intermediate")
+                raise RuntimeError("conversion failed")
+
+            job_id = str(uuid4())
+            manager.submit(job_id, work_dir, "hash", fail)
+            for _ in range(100):
+                if manager.get(job_id).status == "failed" and not work_dir.exists():
+                    break
+                threading.Event().wait(0.01)
+            self.assertEqual(manager.get(job_id).status, "failed")
+            self.assertFalse(work_dir.exists())
+
+    def test_startup_cleanup_removes_only_stale_job_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stale_dir = root / str(uuid4())
+            stale_dir.mkdir()
+            (stale_dir / "input.wav").touch()
+            unrelated_dir = root / "keep-this"
+            unrelated_dir.mkdir()
+
+            settings = replace(api_module.settings, work_dir=root)
+            with patch.object(api_module, "settings", settings):
+                with TestClient(api_module.app):
+                    pass
+
+            self.assertFalse(stale_dir.exists())
+            self.assertTrue(unrelated_dir.is_dir())
 
 
 class MixTests(unittest.TestCase):

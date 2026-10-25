@@ -47,6 +47,8 @@ The first separation can download Demucs weights, and the first conversion can d
 
 Demucs separates vocals from accompaniment before conversion by default. Denoising and WPE dereverberation are opt-in; both add processing time and may change vocal quality. RVC inference performs its own chunked feature/pitch/inference processing. The service hashes each uploaded source with SHA-256, caps uploads and decoded duration, limits concurrent work, and keeps jobs in memory until the service restarts.
 
+Job files are stored under `VOICE_WORK_DIR`. Failed and cancelled jobs are removed when processing stops; successful jobs keep only the downloadable WAV result. On startup, leftover directories named for prior job UUIDs are removed, so completed results are available only until the next restart.
+
 Run the app tests from the repository root with `python -m unittest tests.test_voice_app -v`.
 ```
 ```

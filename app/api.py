@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import shutil
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,6 +15,7 @@ from app.jobs import (
     JobManager,
     JobNotFoundError,
     QueueFullError,
+    cleanup_stale_job_directories,
 )
 from app.voices import InvalidVoiceError, VoiceNotFoundError, VoiceRegistry
 from app.pipeline.convert import ConversionOptions
@@ -26,7 +28,15 @@ settings = Settings()
 settings.validate()
 voices = VoiceRegistry(settings.model_dir)
 jobs = JobManager(settings.max_workers, settings.max_active_jobs)
-app = FastAPI(title="Local Voice Swap", version="1.0.0")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    cleanup_stale_job_directories(settings.work_dir)
+    yield
+
+
+app = FastAPI(title="Local Voice Swap", version="1.0.0", lifespan=lifespan)
 
 ALLOWED_EXTENSIONS = {".wav", ".flac", ".ogg", ".mp3", ".m4a", ".aiff", ".aif"}
 

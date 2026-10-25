@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -111,17 +112,21 @@ class JobManager:
             return job
 
     def _run(self, job: Job, task: Callable[[JobContext], Path]) -> None:
+        cancelled_before_start = False
         with self._lock:
             if job.cancel_event.is_set():
                 job.status = "cancelled"
                 job.stage = "cancelled"
-                return
-            job.status = "running"
-            job.stage = "starting"
+                cancelled_before_start = True
+            else:
+                job.status = "running"
+                job.stage = "starting"
+        if cancelled_before_start:
+            self._cleanup_work_dir(job.work_dir)
+            return
+
         try:
             result_path = task(JobContext(job, self))
-            if job.cancel_event.is_set():
-                raise JobCancelledError("Job was cancelled")
             if not result_path.is_file():
                 raise RuntimeError("Conversion finished without creating an output file")
         except JobCancelledError:
@@ -129,17 +134,30 @@ class JobManager:
                 job.status = "cancelled"
                 job.stage = "cancelled"
         except Exception as error:
-            logger.exception("Voice-conversion job %s failed", job.id)
             with self._lock:
-                job.status = "failed"
-                job.stage = "failed"
-                job.error = f"{type(error).__name__}: {error}"
+                if job.cancel_event.is_set():
+                    job.status = "cancelled"
+                    job.stage = "cancelled"
+                else:
+                    logger.exception("Voice-conversion job %s failed", job.id)
+                    job.status = "failed"
+                    job.stage = "failed"
+                    job.error = f"{type(error).__name__}: {error}"
         else:
             with self._lock:
-                job.status = "succeeded"
-                job.stage = "complete"
-                job.progress = 100
-                job.result_path = result_path.resolve()
+                if job.cancel_event.is_set():
+                    job.status = "cancelled"
+                    job.stage = "cancelled"
+                else:
+                    job.status = "succeeded"
+                    job.stage = "complete"
+                    job.progress = 100
+                    job.result_path = result_path.resolve()
+        finally:
+            with self._lock:
+                succeeded = job.status == "succeeded"
+                result_path = job.result_path if succeeded else None
+            self._cleanup_work_dir(job.work_dir, result_path)
 
     def update(self, job_id: str, progress: int, stage: str) -> None:
         if not 0 <= progress <= 100 or not stage:
@@ -155,6 +173,7 @@ class JobManager:
             return self._get_unlocked(job_id)
 
     def cancel(self, job_id: str) -> Job:
+        cleanup = False
         with self._lock:
             job = self._get_unlocked(job_id)
             if job.status not in {"queued", "running"}:
@@ -165,12 +184,54 @@ class JobManager:
                     job.future.cancel()
                 job.status = "cancelled"
                 job.stage = "cancelled"
+                cleanup = True
             else:
                 job.stage = "cancelling"
-            return job
+        if cleanup:
+            self._cleanup_work_dir(job.work_dir)
+        return job
 
     def _get_unlocked(self, job_id: str) -> Job:
         try:
             return self._jobs[job_id]
         except KeyError as error:
             raise JobNotFoundError(job_id) from error
+
+    @staticmethod
+    def _cleanup_work_dir(work_dir: Path, result_path: Path | None = None) -> None:
+        try:
+            if result_path is None or not work_dir.is_dir():
+                shutil.rmtree(work_dir, ignore_errors=True)
+                return
+
+            resolved_work_dir = work_dir.resolve()
+            resolved_result = result_path.resolve()
+            if resolved_result.parent != resolved_work_dir:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                return
+
+            for child in work_dir.iterdir():
+                if child.resolve() == resolved_result:
+                    continue
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Could not clean voice-conversion job directory %s", work_dir)
+
+
+def cleanup_stale_job_directories(work_dir: Path) -> None:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    for child in work_dir.iterdir():
+        if child.is_symlink() or not child.is_dir():
+            continue
+        try:
+            if str(UUID(child.name)) != child.name:
+                continue
+        except ValueError:
+            continue
+        try:
+            shutil.rmtree(child)
+        except OSError:
+            logger.exception("Could not remove stale job directory %s", child)
