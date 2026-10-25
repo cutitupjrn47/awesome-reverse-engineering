@@ -1,0 +1,15 @@
+fastapi==0.120.0
+uvicorn[standard]==0.38.0
+python-multipart==0.0.20
+# infer_rvc_python's librosa/torchcrepe dependency chain still uses NumPy 1.x aliases.
+numpy==1.26.4
+scipy==1.15.3
+soundfile==0.13.1
+demucs==4.0.1
+infer_rvc_python==1.3.1
+noisereduce==3.0.3
+nara-wpe==0.0.11
+# RVC checkpoints use pickle globals that PyTorch 2.6+ rejects by default in torch.load.
+torch<2.6
+torchaudio<2.6
+torchvision<0.21
