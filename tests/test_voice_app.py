@@ -71,6 +71,32 @@ class VoiceRegistryTests(unittest.TestCase):
             with self.assertRaises(InvalidVoiceError):
                 VoiceRegistry(root).get("demo")
 
+    def test_skips_voice_with_invalid_metadata_encoding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            invalid_voice = root / "bad"
+            invalid_voice.mkdir()
+            (invalid_voice / "model.pth").touch()
+            (invalid_voice / "voice.json").write_bytes(b"\xff")
+            valid_voice = root / "good"
+            valid_voice.mkdir()
+            (valid_voice / "model.pth").touch()
+
+            voices = VoiceRegistry(root).list()
+
+            self.assertEqual([voice.id for voice in voices], ["good"])
+
+    def test_get_rejects_voice_with_invalid_metadata_encoding(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            voice_dir = root / "bad"
+            voice_dir.mkdir()
+            (voice_dir / "model.pth").touch()
+            (voice_dir / "voice.json").write_bytes(b"\xff")
+
+            with self.assertRaises(InvalidVoiceError):
+                VoiceRegistry(root).get("bad")
+
     def test_rejects_invalid_voice_ids(self):
         with tempfile.TemporaryDirectory() as temporary:
             with self.assertRaises(VoiceNotFoundError):

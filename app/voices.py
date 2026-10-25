@@ -79,7 +79,7 @@ class VoiceRegistry:
                 )
             try:
                 contents = json.loads(metadata.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
+            except (OSError, UnicodeError, json.JSONDecodeError) as error:
                 raise InvalidVoiceError(f"Invalid voice.json for '{voice_id}'") from error
             if not isinstance(contents, dict):
                 raise InvalidVoiceError(f"voice.json for '{voice_id}' must be an object")
