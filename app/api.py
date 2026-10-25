@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
+from starlette.formparsers import MultiPartException
 
 from app.config import Settings
 from app.jobs import (
@@ -29,6 +30,89 @@ settings.validate()
 voices = VoiceRegistry(settings.model_dir)
 jobs = JobManager(settings.max_workers, settings.max_active_jobs)
 
+MULTIPART_OVERHEAD_BYTES = 1024 * 1024
+
+
+class RequestBodyTooLarge(MultiPartException):
+    def __init__(self):
+        super().__init__("Request body exceeds the upload size limit")
+
+
+class SwapRequestBodyLimitMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if (
+            scope["type"] != "http"
+            or scope["method"] != "POST"
+            or scope["path"] != "/swap"
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        max_body_bytes = settings.max_upload_bytes + MULTIPART_OVERHEAD_BYTES
+        content_lengths = [
+            value.strip()
+            for name, value in scope.get("headers", [])
+            if name.lower() == b"content-length"
+        ]
+        if len(content_lengths) == 1 and content_lengths[0].isdigit():
+            if int(content_lengths[0]) > max_body_bytes:
+                await self._send_too_large(send)
+                return
+
+        received_bytes = 0
+        request_too_large = False
+        response_started = False
+        too_large_response_sent = False
+
+        async def receive_limited():
+            nonlocal received_bytes, request_too_large
+            message = await receive()
+            if message["type"] == "http.request":
+                received_bytes += len(message.get("body", b""))
+                if received_bytes > max_body_bytes:
+                    request_too_large = True
+                    raise RequestBodyTooLarge
+            return message
+
+        async def send_limited(message):
+            nonlocal response_started, too_large_response_sent
+            if request_too_large:
+                if (
+                    message["type"] == "http.response.start"
+                    and not too_large_response_sent
+                ):
+                    await self._send_too_large(send)
+                    response_started = True
+                    too_large_response_sent = True
+                return
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, receive_limited, send_limited)
+        except RequestBodyTooLarge:
+            if not response_started and not too_large_response_sent:
+                await self._send_too_large(send)
+
+    @staticmethod
+    async def _send_too_large(send):
+        body = b"Request body exceeds the upload size limit"
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -37,6 +121,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Local Voice Swap", version="1.0.0", lifespan=lifespan)
+app.add_middleware(SwapRequestBodyLimitMiddleware)
 
 ALLOWED_EXTENSIONS = {".wav", ".flac", ".ogg", ".mp3", ".m4a", ".aiff", ".aif"}
 

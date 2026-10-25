@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import threading
 import time
@@ -360,6 +361,108 @@ class PipelineTests(unittest.TestCase):
 
 
 class ApiTests(unittest.TestCase):
+    def test_swap_rejects_oversized_request_before_multipart_parsing(self):
+        max_upload_bytes = 1024
+        settings = replace(api_module.settings, max_upload_bytes=max_upload_bytes)
+        boundary = "upload-boundary"
+        audio = b"x" * (
+            max_upload_bytes + 2 * api_module.MULTIPART_OVERHEAD_BYTES
+        )
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="audio"; filename="input.wav"\r\n'
+            "Content-Type: audio/wav\r\n\r\n"
+        ).encode("ascii") + audio + (
+            f"\r\n--{boundary}\r\n"
+            'Content-Disposition: form-data; name="voice_id"\r\n\r\n'
+            "demo\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("ascii")
+
+        async def invoke(headers):
+            chunk_size = 64 * 1024
+            chunks = [
+                body[offset : offset + chunk_size]
+                for offset in range(0, len(body), chunk_size)
+            ]
+            received = 0
+            response = {}
+
+            async def receive():
+                nonlocal received
+                received += 1
+                if received <= len(chunks):
+                    return {
+                        "type": "http.request",
+                        "body": chunks[received - 1],
+                        "more_body": received < len(chunks),
+                    }
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            async def send(message):
+                if message["type"] == "http.response.start":
+                    response["status"] = message["status"]
+
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.3"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": "/swap",
+                "raw_path": b"/swap",
+                "query_string": b"",
+                "headers": headers,
+                "client": ("test", 123),
+                "server": ("test", 80),
+                "root_path": "",
+                "state": {},
+            }
+            with patch.object(api_module, "settings", settings):
+                await api_module.app(scope, receive, send)
+            return response.get("status"), received, len(chunks)
+
+        content_length_status, receive_calls, _ = asyncio.run(
+            invoke(
+                [
+                    (
+                        b"content-type",
+                        f"multipart/form-data; boundary={boundary}".encode(),
+                    ),
+                    (b"content-length", str(len(body)).encode()),
+                ]
+            )
+        )
+        self.assertEqual(content_length_status, 413)
+        self.assertEqual(receive_calls, 0)
+
+        chunked_status, receive_calls, chunk_count = asyncio.run(
+            invoke(
+                [
+                    (
+                        b"content-type",
+                        f"multipart/form-data; boundary={boundary}".encode(),
+                    )
+                ]
+            )
+        )
+        self.assertEqual(chunked_status, 413)
+        self.assertLess(receive_calls, chunk_count)
+
+        invalid_length_status, receive_calls, chunk_count = asyncio.run(
+            invoke(
+                [
+                    (
+                        b"content-type",
+                        f"multipart/form-data; boundary={boundary}".encode(),
+                    ),
+                    (b"content-length", b"not-a-length"),
+                ]
+            )
+        )
+        self.assertEqual(invalid_length_status, 413)
+        self.assertLess(receive_calls, chunk_count)
+
     def test_swap_upload_creates_pollable_job_and_downloadable_result(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -371,6 +474,7 @@ class ApiTests(unittest.TestCase):
                 api_module.settings,
                 model_dir=model_dir,
                 work_dir=root / "jobs",
+                max_upload_bytes=len(b"audio"),
                 max_active_jobs=2,
                 max_workers=1,
             )
