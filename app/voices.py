@@ -67,8 +67,17 @@ class VoiceRegistry:
             )
         checkpoint = checkpoints[0]
         index = indexes[0] if indexes else None
-        if not self._safe_path(checkpoint) or (index and not self._safe_path(index)):
-            raise InvalidVoiceError(f"Voice '{voice_id}' contains an unsafe file path")
+        if (
+            not self._safe_path(checkpoint)
+            or not checkpoint.is_file()
+            or (
+                index
+                and (not self._safe_path(index) or not index.is_file())
+            )
+        ):
+            raise InvalidVoiceError(
+                f"Voice '{voice_id}' must contain regular checkpoint and index files"
+            )
 
         display_name = voice_id
         metadata = directory / "voice.json"

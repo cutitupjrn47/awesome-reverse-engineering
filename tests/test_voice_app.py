@@ -71,6 +71,46 @@ class VoiceRegistryTests(unittest.TestCase):
             with self.assertRaises(InvalidVoiceError):
                 VoiceRegistry(root).get("demo")
 
+    def test_rejects_checkpoint_and_index_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint_voice = root / "checkpoint-directory"
+            checkpoint_voice.mkdir()
+            (checkpoint_voice / "model.pth").mkdir()
+            index_voice = root / "index-directory"
+            index_voice.mkdir()
+            (index_voice / "model.pth").touch()
+            (index_voice / "features.index").mkdir()
+
+            registry = VoiceRegistry(root)
+            for voice_id in ("checkpoint-directory", "index-directory"):
+                with self.subTest(voice_id=voice_id):
+                    with self.assertRaises(InvalidVoiceError):
+                        registry.get(voice_id)
+
+            self.assertEqual(registry.list(), [])
+
+    def test_rejects_dangling_checkpoint_and_index_symlinks(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            try:
+                checkpoint_voice = root / "checkpoint-symlink"
+                checkpoint_voice.mkdir()
+                (checkpoint_voice / "model.pth").symlink_to(root / "missing.pth")
+                index_voice = root / "index-symlink"
+                index_voice.mkdir()
+                (index_voice / "model.pth").touch()
+                (index_voice / "features.index").symlink_to(root / "missing.index")
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"Cannot create symlinks: {error}")
+
+            registry = VoiceRegistry(root)
+            for voice_id in ("checkpoint-symlink", "index-symlink"):
+                with self.subTest(voice_id=voice_id):
+                    with self.assertRaises(InvalidVoiceError):
+                        registry.get(voice_id)
+            self.assertEqual(registry.list(), [])
+
     def test_skips_voice_with_invalid_metadata_encoding(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
