@@ -37,6 +37,8 @@ def decode_audio(
                 "-y",
                 "-i",
                 str(source_path),
+                "-t",
+                str(max_duration_seconds + 1),
                 "-map",
                 "0:a:0",
                 "-ac",

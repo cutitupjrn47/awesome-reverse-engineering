@@ -21,6 +21,7 @@ from app.jobs import JobManager, QueueFullError
 from app.voices import InvalidVoiceError, Voice, VoiceNotFoundError, VoiceRegistry
 from app.pipeline.clean import clean_audio
 from app.pipeline.convert import ConversionOptions, RVCConverter
+from app.pipeline.ingest import AudioInputError, decode_audio
 from app.pipeline.mix import mix_audio
 from app.pipeline.run import SwapOptions, run_pipeline
 
@@ -168,6 +169,29 @@ class ConverterTests(unittest.TestCase):
             self.assertTrue(np.allclose(audio, [32767 / 32768, -1.0]))
             self.assertEqual(converter._loader.options["tag"], "voice-demo")
             self.assertEqual(converter._loader.options["file_model"], str(model_path))
+
+
+class IngestTests(unittest.TestCase):
+    def test_limits_ffmpeg_output_and_rejects_audio_over_duration(self):
+        command = []
+
+        def run_ffmpeg(args, **kwargs):
+            command.extend(args)
+
+        with (
+            patch("app.pipeline.ingest.shutil.which", return_value="ffmpeg"),
+            patch("app.pipeline.ingest.subprocess.run", side_effect=run_ffmpeg),
+            patch(
+                "app.pipeline.ingest.sf.info",
+                return_value=SimpleNamespace(frames=88200, duration=2),
+            ),
+            patch("app.pipeline.ingest.sf.read") as read_audio,
+        ):
+            with self.assertRaisesRegex(AudioInputError, "between 0 and 1 seconds"):
+                decode_audio(Path("input.mp3"), Path("decoded.wav"), 1)
+
+        self.assertEqual(command[command.index("-t") + 1], "2")
+        self.assertFalse(read_audio.called)
 
 
 class PipelineTests(unittest.TestCase):
