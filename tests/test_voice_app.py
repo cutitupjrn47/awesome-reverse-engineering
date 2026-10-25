@@ -240,6 +240,53 @@ class JobManagerTests(unittest.TestCase):
             self.assertFalse(stale_dir.exists())
             self.assertTrue(unrelated_dir.is_dir())
 
+    def test_lifespan_cancels_jobs_and_exposes_manager_to_requests(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = replace(
+                api_module.settings,
+                work_dir=root / "jobs",
+                max_workers=1,
+                max_active_jobs=2,
+            )
+            running_started = threading.Event()
+            queued_started = threading.Event()
+            running_id = str(uuid4())
+            queued_id = str(uuid4())
+            running_dir = settings.work_dir / running_id
+            queued_dir = settings.work_dir / queued_id
+            running_dir.mkdir(parents=True)
+            queued_dir.mkdir()
+
+            def wait_for_cancellation(context):
+                running_started.set()
+                context.cancel_event.wait(5)
+                context.check_cancelled()
+                return running_dir / "result.wav"
+
+            def queued_task(context):
+                queued_started.set()
+                return queued_dir / "result.wav"
+
+            with patch.object(api_module, "settings", settings):
+                with TestClient(api_module.app) as client:
+                    manager = client.app.state.jobs
+                    manager.submit(running_id, running_dir, "hash", wait_for_cancellation)
+                    self.assertTrue(running_started.wait(1))
+                    manager.submit(queued_id, queued_dir, "hash", queued_task)
+
+                    response = client.get(f"/jobs/{running_id}")
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.json()["status"], "running")
+
+            self.assertEqual(manager.get(running_id).status, "cancelled")
+            self.assertEqual(manager.get(queued_id).status, "cancelled")
+            self.assertFalse(queued_started.is_set())
+            self.assertFalse(running_dir.exists())
+            self.assertFalse(queued_dir.exists())
+            with self.assertRaisesRegex(RuntimeError, "shut down"):
+                manager.submit(str(uuid4()), root, "hash", queued_task)
+
 
 class MixTests(unittest.TestCase):
     def test_matches_vocal_loudness_and_returns_stereo_at_backing_length(self):
@@ -478,7 +525,6 @@ class ApiTests(unittest.TestCase):
                 max_active_jobs=2,
                 max_workers=1,
             )
-            manager = JobManager(max_workers=1, max_active_jobs=2)
 
             def fake_pipeline(context, input_path, output_path, voice, options, config):
                 self.assertEqual(input_path.read_bytes(), b"audio")
@@ -489,27 +535,28 @@ class ApiTests(unittest.TestCase):
             with (
                 patch.object(api_module, "settings", settings),
                 patch.object(api_module, "voices", VoiceRegistry(model_dir)),
-                patch.object(api_module, "jobs", manager),
                 patch.object(api_module, "run_pipeline", fake_pipeline),
             ):
-                client = TestClient(api_module.app)
-                response = client.post(
-                    "/swap",
-                    files={"audio": ("input.wav", b"audio", "audio/wav")},
-                    data={"voice_id": "demo", "separate": "false"},
-                )
-                self.assertEqual(response.status_code, 202, response.text)
-                job_id = response.json()["id"]
-                for _ in range(100):
-                    job = client.get(f"/jobs/{job_id}").json()
-                    if job["status"] in {"succeeded", "failed"}:
-                        break
-                    time.sleep(0.01)
+                with TestClient(api_module.app) as client:
+                    manager = client.app.state.jobs
+                    self.assertIsInstance(manager, JobManager)
+                    response = client.post(
+                        "/swap",
+                        files={"audio": ("input.wav", b"audio", "audio/wav")},
+                        data={"voice_id": "demo", "separate": "false"},
+                    )
+                    self.assertEqual(response.status_code, 202, response.text)
+                    job_id = response.json()["id"]
+                    for _ in range(100):
+                        job = client.get(f"/jobs/{job_id}").json()
+                        if job["status"] in {"succeeded", "failed"}:
+                            break
+                        time.sleep(0.01)
 
-                self.assertEqual(job["status"], "succeeded", job)
-                result = client.get(f"/jobs/{job_id}/result")
-                self.assertEqual(result.status_code, 200)
-                self.assertEqual(result.content, b"wav-result")
+                    self.assertEqual(job["status"], "succeeded", job)
+                    result = client.get(f"/jobs/{job_id}/result")
+                    self.assertEqual(result.status_code, 200)
+                    self.assertEqual(result.content, b"wav-result")
 
 
 if __name__ == "__main__":

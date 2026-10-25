@@ -89,6 +89,8 @@ class JobManager:
         self._max_active_jobs = max_active_jobs
         self._jobs: dict[str, Job] = {}
         self._lock = threading.RLock()
+        self._shutdown_lock = threading.Lock()
+        self._shutdown = False
 
     def submit(
         self,
@@ -99,6 +101,8 @@ class JobManager:
     ) -> Job:
         UUID(job_id)
         with self._lock:
+            if self._shutdown:
+                raise RuntimeError("The voice-conversion job manager is shut down")
             active = sum(
                 job.status in {"queued", "running"} for job in self._jobs.values()
             )
@@ -110,6 +114,30 @@ class JobManager:
             self._jobs[job_id] = job
             job.future = self._executor.submit(self._run, job, task)
             return job
+
+    def shutdown(self) -> None:
+        with self._shutdown_lock:
+            queued_jobs: list[Job] = []
+            with self._lock:
+                if self._shutdown:
+                    return
+                self._shutdown = True
+                for job in self._jobs.values():
+                    if job.status not in {"queued", "running"}:
+                        continue
+                    job.cancel_event.set()
+                    if job.status == "queued":
+                        if job.future is not None:
+                            job.future.cancel()
+                        job.status = "cancelled"
+                        job.stage = "cancelled"
+                        queued_jobs.append(job)
+                    else:
+                        job.stage = "cancelling"
+
+            for job in queued_jobs:
+                self._cleanup_work_dir(job.work_dir)
+            self._executor.shutdown(wait=True, cancel_futures=True)
 
     def _run(self, job: Job, task: Callable[[JobContext], Path]) -> None:
         cancelled_before_start = False

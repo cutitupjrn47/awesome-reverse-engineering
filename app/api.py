@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
 from starlette.formparsers import MultiPartException
 
@@ -28,7 +28,6 @@ logger = logging.getLogger(__name__)
 settings = Settings()
 settings.validate()
 voices = VoiceRegistry(settings.model_dir)
-jobs = JobManager(settings.max_workers, settings.max_active_jobs)
 
 MULTIPART_OVERHEAD_BYTES = 1024 * 1024
 
@@ -117,7 +116,12 @@ class SwapRequestBodyLimitMiddleware:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     cleanup_stale_job_directories(settings.work_dir)
-    yield
+    manager = JobManager(settings.max_workers, settings.max_active_jobs)
+    _app.state.jobs = manager
+    try:
+        yield
+    finally:
+        manager.shutdown()
 
 
 app = FastAPI(title="Local Voice Swap", version="1.0.0", lifespan=lifespan)
@@ -144,6 +148,7 @@ def list_voices() -> list[dict[str, object]]:
 
 @app.post("/swap", status_code=status.HTTP_202_ACCEPTED)
 async def create_swap(
+    request: Request,
     audio: UploadFile = File(...),
     voice_id: str = Form(...),
     pitch_shift: int = Form(0, ge=-24, le=24),
@@ -206,7 +211,7 @@ async def create_swap(
         )
 
     try:
-        job = jobs.submit(job_id, work_dir, input_hash, task)
+        job = request.app.state.jobs.submit(job_id, work_dir, input_hash, task)
     except QueueFullError as error:
         shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(429, str(error)) from error
@@ -214,17 +219,17 @@ async def create_swap(
 
 
 @app.get("/jobs/{job_id}")
-def get_job(job_id: str) -> dict[str, object]:
+def get_job(job_id: str, request: Request) -> dict[str, object]:
     try:
-        return jobs.get(job_id).public()
+        return request.app.state.jobs.get(job_id).public()
     except JobNotFoundError as error:
         raise HTTPException(404, "Job not found") from error
 
 
 @app.delete("/jobs/{job_id}")
-def cancel_job(job_id: str) -> dict[str, object]:
+def cancel_job(job_id: str, request: Request) -> dict[str, object]:
     try:
-        return jobs.cancel(job_id).public()
+        return request.app.state.jobs.cancel(job_id).public()
     except JobNotFoundError as error:
         raise HTTPException(404, "Job not found") from error
     except JobConflictError as error:
@@ -232,9 +237,9 @@ def cancel_job(job_id: str) -> dict[str, object]:
 
 
 @app.get("/jobs/{job_id}/result")
-def download_result(job_id: str) -> FileResponse:
+def download_result(job_id: str, request: Request) -> FileResponse:
     try:
-        job = jobs.get(job_id)
+        job = request.app.state.jobs.get(job_id)
     except JobNotFoundError as error:
         raise HTTPException(404, "Job not found") from error
     if job.status != "succeeded" or job.result_path is None:
